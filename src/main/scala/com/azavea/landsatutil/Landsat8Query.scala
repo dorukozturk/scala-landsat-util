@@ -1,10 +1,9 @@
 package com.azavea.landsatutil
 
 import akka.actor.ActorSystem
-import com.typesafe.config.ConfigFactory
+import com.typesafe.config.{Config, ConfigFactory}
 import geotrellis.vector._
 import Json._
-
 import java.time.{ZoneOffset, ZonedDateTime}
 import java.time.format.DateTimeFormatter
 import java.util.Locale
@@ -14,11 +13,13 @@ case class QueryResult(metadata: QueryMetadata, images: Seq[LandsatImage]) {
     QueryResult(metadata: QueryMetadata, f(images))
 }
 
-case class QueryMetadata(total: Int, skip: Int, limit: Int, lastUpdated: ZonedDateTime)
+case class QueryMetadata(found: Int, page: Int, limit: Int)
 
 object Landsat8Query {
-  val conf = ConfigFactory.load()
-  val API_URL = conf.getString("landsatutil.apiUrl")
+  val conf: Config = ConfigFactory.load()
+  val API_URL: String = conf.getString("landsatutil.apiUrl")
+  val ExecuteQueryLimit = 1000
+  val CollectQueryLimit = 100
 
   def apply(): Landsat8Query =
     new Landsat8Query
@@ -113,15 +114,15 @@ class Landsat8Query() {
     this
   }
 
-  def searchTerms =
+  def searchTerms: String =
     Array(
       _boundsQuery,
       s"cloudCoverFull:[${doubleString(_cloudCoverageMin, 2)}+TO+${doubleString(_cloudCoverageMax, 2)}]",
       aquisitionDate
     ).filter(!_.isEmpty).mkString("+AND+")
 
-  def execute(limit: Int = 1000, skip: Int = 0)(implicit timeout: scala.concurrent.duration.Duration): Option[QueryResult] = {
-    val search = s"search=$searchTerms&limit=$limit&skip=$skip"
+  def execute(limit: Int = Landsat8Query.ExecuteQueryLimit, page: Int = 1)(implicit timeout: scala.concurrent.duration.Duration): Option[QueryResult] = {
+    val search = s"search=$searchTerms&limit=$limit&page=$page"
     val url = s"${Landsat8Query.API_URL}?$search"
     try {
       val result = HttpClient.get[QueryResult](url)
@@ -140,17 +141,13 @@ class Landsat8Query() {
     val url = s"${Landsat8Query.API_URL}?$search"
     val system = ActorSystem(s"landsat_query_collect_${java.util.UUID.randomUUID}")
     try {
-      val count = HttpClient.get[QueryResult](url, system).metadata.total
+      val count = HttpClient.get[QueryResult](url, system).metadata.found
 
-      val groups = {
-        val g = count / 100
-        if(g * 100 == count) g else g + 1
-      }
+      val pages = count / Landsat8Query.CollectQueryLimit + 1
 
-      (0 until groups)
-        .map { g =>
-          val skip = g * 100
-          s"${Landsat8Query.API_URL}?$search&limit=100&skip=$skip"
+      (1 to pages)
+        .map { page =>
+          s"${Landsat8Query.API_URL}?$search&limit=${Landsat8Query.CollectQueryLimit}&page=$page"
         }
         .par
         .flatMap { url => HttpClient.get[QueryResult](url, system).images }
@@ -161,7 +158,7 @@ class Landsat8Query() {
         // Not found
         Seq()
     } finally {
-      system.shutdown()
+      system.terminate()
     }
 
   }
